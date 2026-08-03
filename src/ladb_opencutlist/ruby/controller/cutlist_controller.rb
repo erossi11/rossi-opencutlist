@@ -8,6 +8,9 @@ module Ladb::OpenCutList
   require_relative '../observer/materials_observer'
   require_relative '../observer/model_observer'
   require_relative '../lib/fiddle/packy/packy'
+  require 'json'
+  require 'net/http'
+  require 'uri'
 
   Packy = Fiddle::Packy
 
@@ -22,6 +25,10 @@ module Ladb::OpenCutList
       # Setup opencutlist dialog actions
       PLUGIN.register_command("cutlist_generate") do |settings|
         generate_command(settings)
+      end
+
+      PLUGIN.register_command("cutlist_export_rossi") do
+        export_rossi_command
       end
 
       PLUGIN.register_command("cutlist_export") do |settings|
@@ -161,19 +168,660 @@ module Ladb::OpenCutList
 
     # -- Commands --
 
+
+    def export_rossi_command
+      unless @cutlist
+        UI.messagebox('Primero debe generar el listado de partes.')
+
+        return {
+          ok: false,
+          error: 'cutlist_not_generated'
+        }
+      end
+
+      datos_presupuesto = solicitar_datos_presupuesto
+
+      return {
+        ok: false,
+        cancelled: true
+      } unless datos_presupuesto
+
+      cutlist_hash = @cutlist.to_hash
+
+      calcular_cortes_placas_async(
+        cutlist_hash,
+        datos_presupuesto
+      )
+
+      {
+        ok: true,
+        processing: true
+      }
+    end
+
+    def calcular_cortes_placas_async(
+      cutlist_hash,
+      datos_presupuesto
+    )
+      require_relative '../worker/cutlist/cutlist_cuttingdiagram2d_worker'
+
+      groups = cutlist_hash[:groups] || cutlist_hash['groups'] || []
+
+      grupos_placa = groups.select do |group_hash|
+        material_type = (
+          group_hash[:material_type_strippedname] ||
+          group_hash['material_type_strippedname'] ||
+          ''
+        ).to_s.strip
+
+        material_type == 'sheet_good'
+      end
+
+      cortes_por_grupo = {}
+
+      procesar_siguiente_grupo_rossi(
+        grupos_placa,
+        0,
+        cutlist_hash,
+        datos_presupuesto,
+        cortes_por_grupo
+      )
+    end
+
+    def procesar_siguiente_grupo_rossi(
+      grupos,
+      indice,
+      cutlist_hash,
+      datos_presupuesto,
+      cortes_por_grupo
+    )
+      if indice >= grupos.length
+        finalizar_exportacion_rossi(
+          cutlist_hash,
+          datos_presupuesto,
+          cortes_por_grupo
+        )
+
+        return
+      end
+
+      group_hash = grupos[indice]
+
+      group_id =
+        group_hash[:id] ||
+        group_hash['id']
+
+      material_name = (
+        group_hash[:material_name] ||
+        group_hash['material_name'] ||
+        'Material sin nombre'
+      ).to_s
+
+      # Tamaño estándar de placa utilizado por Rossi.
+      std_sheet = '2750mm x 1830mm'
+
+      if group_id.nil?
+        puts "ROSSI: grupo sin ID para #{material_name}"
+
+        procesar_siguiente_grupo_rossi(
+          grupos,
+          indice + 1,
+          cutlist_hash,
+          datos_presupuesto,
+          cortes_por_grupo
+        )
+
+        return
+      end
+
+      puts "ROSSI: optimizando #{material_name}"
+      puts "ROSSI: group_id = #{group_id.inspect}"
+      puts "ROSSI: std_sheet = #{std_sheet.inspect}"
+
+      begin
+        worker = CutlistCuttingdiagram2dWorker.new(
+          @cutlist,
+          group_id: group_id,
+          std_sheet: std_sheet,
+          scrap_sheet_sizes: '',
+          saw_kerf: '3mm',
+          trimming: '10mm',
+          sheet_folding: false
+        )
+
+        avanzar_optimizacion_rossi(
+          worker,
+          grupos,
+          indice,
+          cutlist_hash,
+          datos_presupuesto,
+          cortes_por_grupo,
+          group_id,
+          material_name
+        )
+      rescue StandardError => e
+        puts "ROSSI: error creando el optimizador para #{material_name}"
+        puts "#{e.class}: #{e.message}"
+        puts e.backtrace.first(10).join("\n")
+
+        UI.messagebox(
+          "Error al crear la optimización para " \
+          "'#{material_name}'.\n\n" \
+          "#{e.class}: #{e.message}"
+        )
+
+        cortes_por_grupo[group_id.to_s] = {
+          cantidad_cortes: 0,
+          cantidad_placas: 0
+        }
+
+        procesar_siguiente_grupo_rossi(
+          grupos,
+          indice + 1,
+          cutlist_hash,
+          datos_presupuesto,
+          cortes_por_grupo
+        )
+      end
+    end
+
+    def avanzar_optimizacion_rossi(
+      worker,
+      grupos,
+      indice,
+      cutlist_hash,
+      datos_presupuesto,
+      cortes_por_grupo,
+      group_id,
+      material_name
+    )
+      UI.start_timer(0.05, false) do
+        begin
+          resultado = worker.run(true)
+
+          puts "ROSSI: resultado worker = #{resultado.class}"
+          puts "ROSSI: resultado = #{resultado.inspect}"
+
+          # La primera llamada puede devolver:
+          # { estimated_steps: 1 }
+          #
+          # Todavía no es el diagrama final.
+          if resultado.is_a?(Hash)
+            puts 'ROSSI: optimizador inicializado, avanzando...'
+
+            avanzar_optimizacion_rossi(
+              worker,
+              grupos,
+              indice,
+              cutlist_hash,
+              datos_presupuesto,
+              cortes_por_grupo,
+              group_id,
+              material_name
+            )
+
+            next
+          end
+
+          unless resultado.respond_to?(:sheets)
+            raise(
+              "El optimizador devolvió un resultado inesperado: " \
+              "#{resultado.class}"
+            )
+          end
+
+          # Si ya existen hojas, la optimización terminó.
+          if resultado.sheets.length > 0
+            puts "ROSSI: optimización terminada para #{material_name}"
+            puts "ROSSI: hojas generadas = #{resultado.sheets.length}"
+
+            procesar_resultado_cortes_rossi(
+              resultado,
+              cortes_por_grupo,
+              group_id
+            )
+
+            procesar_siguiente_grupo_rossi(
+              grupos,
+              indice + 1,
+              cutlist_hash,
+              datos_presupuesto,
+              cortes_por_grupo
+            )
+          else
+            puts 'ROSSI: optimización todavía en proceso...'
+
+            avanzar_optimizacion_rossi(
+              worker,
+              grupos,
+              indice,
+              cutlist_hash,
+              datos_presupuesto,
+              cortes_por_grupo,
+              group_id,
+              material_name
+            )
+          end
+
+        rescue StandardError => e
+          puts "ROSSI: error optimizando #{material_name}"
+          puts "#{e.class}: #{e.message}"
+          puts e.backtrace.first(10).join("\n")
+
+          cortes_por_grupo[group_id.to_s] = {
+            cantidad_cortes: 0,
+            cantidad_placas: 0
+          }
+
+          procesar_siguiente_grupo_rossi(
+            grupos,
+            indice + 1,
+            cutlist_hash,
+            datos_presupuesto,
+            cortes_por_grupo
+          )
+        end
+      end
+    end
+
+    def procesar_resultado_cortes_rossi(
+      cuttingdiagram,
+      cortes_por_grupo,
+      group_id
+    )
+      cuttingdiagram_hash = cuttingdiagram.to_hash
+
+      puts 'ROSSI: diagrama final'
+      puts JSON.pretty_generate(cuttingdiagram_hash)
+
+      summary =
+        cuttingdiagram_hash[:summary] ||
+        cuttingdiagram_hash['summary'] ||
+        {}
+
+      total_cut_count = (
+        summary[:total_cut_count] ||
+        summary['total_cut_count'] ||
+        0
+      ).to_i
+
+      total_used_count = (
+        summary[:total_used_count] ||
+        summary['total_used_count'] ||
+        0
+      ).to_i
+
+      cortes_por_grupo[group_id.to_s] = {
+        cantidad_cortes: total_cut_count,
+        cantidad_placas: total_used_count
+      }
+
+      puts "ROSSI: cortes encontrados = #{total_cut_count}"
+      puts "ROSSI: placas utilizadas = #{total_used_count}"
+    end
+
+    def finalizar_exportacion_rossi(
+      cutlist_hash,
+      datos_presupuesto,
+      cortes_por_grupo
+    )
+      rossi_payload = {
+        schema_version: '1.0',
+        source: 'opencutlist',
+        numero_presupuesto:
+          datos_presupuesto[:numero_presupuesto],
+        nombre_amoblamiento:
+          datos_presupuesto[:nombre_amoblamiento],
+        filename:
+          cutlist_hash[:filename] ||
+          cutlist_hash['filename'],
+        productos: build_rossi_products(
+          cutlist_hash,
+          cortes_por_grupo
+        )
+      }
+
+      puts 'ROSSI: payload final'
+      puts JSON.pretty_generate(rossi_payload)
+
+      enviar_post_rossi(rossi_payload)
+    end
+
+    def calcular_cortes_placas(cutlist_hash)
+      require_relative '../worker/cutlist/cutlist_cuttingdiagram2d_worker'
+
+      groups = cutlist_hash[:groups] || cutlist_hash['groups'] || []
+      cortes_por_grupo = {}
+
+      groups.each do |group_hash|
+        material_type = (
+          group_hash[:material_type_strippedname] ||
+          group_hash['material_type_strippedname'] ||
+          ''
+        ).to_s.strip
+
+        next unless material_type == 'sheet_good'
+
+        group_id =
+          group_hash[:id] ||
+          group_hash['id']
+
+        next if group_id.nil?
+
+
+        
+
+        # Tamaño de placa Rossi: 2,75 m × 1,83 m
+        std_sheet = '2750mm x 1830mm'
+
+        material_name =
+          group_hash[:material_name] ||
+          group_hash['material_name'] ||
+          'Material sin nombre'
+
+        
+
+        begin
+          puts "ROSSI: creando optimizador para #{material_name}"
+          puts "ROSSI: group_id = #{group_id.inspect}"
+          puts "ROSSI: std_sheet = #{std_sheet.inspect}"
+
+          worker = CutlistCuttingdiagram2dWorker.new(
+            @cutlist,
+            group_id: group_id,
+            std_sheet: std_sheet,
+            scrap_sheet_sizes: '',
+            saw_kerf: '3mm',
+            trimming: '10mm',
+            sheet_folding: false
+          )
+
+          puts 'ROSSI: ejecutando worker.run(false)'
+
+          cuttingdiagram = worker.run(false)
+
+          puts 'ROSSI: optimización terminada'
+
+          cuttingdiagram_hash = cuttingdiagram.to_hash
+
+          puts JSON.pretty_generate(cuttingdiagram_hash)
+
+          summary =
+            cuttingdiagram_hash[:summary] ||
+            cuttingdiagram_hash['summary'] ||
+            {}
+
+          total_cut_count = (
+            summary[:total_cut_count] ||
+            summary['total_cut_count'] ||
+            0
+          ).to_i
+
+          total_used_count = (
+            summary[:total_used_count] ||
+            summary['total_used_count'] ||
+            0
+          ).to_i
+
+          cortes_por_grupo[group_id.to_s] = {
+            cantidad_cortes: total_cut_count,
+            cantidad_placas: total_used_count
+          }
+
+        rescue StandardError => e
+          mensaje = [
+            'Error al calcular cortes de placa.',
+            '',
+            "Material: #{material_name}",
+            "Grupo: #{group_id.inspect}",
+            "Placa: #{std_sheet.inspect}",
+            '',
+            "#{e.class}: #{e.message}",
+            '',
+            e.backtrace.first(10).join("\n")
+          ].join("\n")
+
+          puts mensaje
+          UI.messagebox(mensaje)
+
+          # Para que la exportación continúe aunque falle el optimizador
+          cortes_por_grupo[group_id.to_s] = {
+            cantidad_cortes: 0,
+            cantidad_placas: 0
+          }
+        end
+      end
+
+      cortes_por_grupo
+    end
+
     def generate_command(settings)
       require_relative '../worker/cutlist/cutlist_generate_worker'
 
-      # Invalidate Cutlist if it exists
       @cutlist.invalidate if @cutlist
 
-      # Setup worker
       worker = CutlistGenerateWorker.new(**settings)
 
-      # Run !
       @cutlist = worker.run
 
       @cutlist.to_hash
+    end
+
+    def solicitar_datos_presupuesto
+      prompts = [
+        'Número de presupuesto',
+        'Nombre del amoblamiento'
+      ]
+
+      defaults = [
+        '',
+        Sketchup.active_model.title.to_s
+      ]
+
+      result = UI.inputbox(
+        prompts,
+        defaults,
+        'Datos del presupuesto Rossi'
+      )
+
+      # El usuario presionó Cancelar
+      return nil unless result
+
+      numero_presupuesto = result[0].to_s.strip
+      nombre_amoblamiento = result[1].to_s.strip
+
+      if numero_presupuesto.empty?
+        UI.messagebox('Debe ingresar el número de presupuesto.')
+        return nil
+      end
+
+      if nombre_amoblamiento.empty?
+        UI.messagebox('Debe ingresar el nombre del amoblamiento.')
+        return nil
+      end
+
+      {
+        numero_presupuesto: numero_presupuesto,
+        nombre_amoblamiento: nombre_amoblamiento
+      }
+    end
+
+
+    def build_rossi_products(cutlist_hash, cortes_por_grupo = {})
+      groups = cutlist_hash[:groups] || cutlist_hash['groups'] || []
+
+      groups.map do |group|
+        group_id =
+          group[:id] ||
+          group['id']
+
+        material_name =
+          group[:material_name] ||
+          group['material_name'] ||
+          ''
+
+        material_type = (
+          group[:material_type_strippedname] ||
+          group['material_type_strippedname'] ||
+          ''
+        ).to_s.strip
+
+        producto = {
+          nombre_ocl: material_name.to_s.strip,
+          tipo: material_type
+        }
+
+        case material_type
+        when 'sheet_good'
+          espesor = parse_ocl_number(
+            group[:std_thickness] ||
+            group['std_thickness']
+          )
+
+          if espesor <= 0
+            raise(
+              "No se pudo obtener el espesor del material " \
+              "'#{material_name}'."
+            )
+          end
+
+          producto[:cantidad] = parse_ocl_number(
+            group[:total_cutting_area] ||
+            group['total_cutting_area']
+          )
+
+          producto[:unidad] = 'm2'
+          producto[:espesor_ocl] = espesor.round(2)
+
+          producto[:cantidad_piezas] = (
+            group[:part_count] ||
+            group['part_count'] ||
+            0
+          ).to_i
+
+          optimizacion =
+            cortes_por_grupo[group_id.to_s] ||
+            {}
+
+          producto[:cantidad_cortes] = (
+            optimizacion[:cantidad_cortes] ||
+            0
+          ).to_i
+
+          producto[:cantidad_placas] = (
+            optimizacion[:cantidad_placas] ||
+            0
+          ).to_i
+
+        when 'edge'
+          producto[:cantidad] = parse_ocl_number(
+            group[:total_cutting_length] ||
+            group['total_cutting_length']
+          )
+
+          producto[:unidad] = 'm'
+
+        else
+          producto[:cantidad] = (
+            group[:part_count] ||
+            group['part_count'] ||
+            0
+          ).to_i
+
+          producto[:unidad] = 'unidad'
+        end
+
+        producto
+      end
+    end
+
+    def enviar_post_rossi(payload)
+      endpoint = PLUGIN.read_default(Plugin::SETTINGS_KEY_ROSSI_API_ENDPOINT, nil)
+      api_key = PLUGIN.read_default(Plugin::SETTINGS_KEY_ROSSI_API_KEY, nil)
+
+      if endpoint.to_s.strip.empty? || api_key.to_s.strip.empty?
+        UI.messagebox(
+          "No se configuró la conexión con el sistema de gestión Rossi.\n\n" \
+          "Configurar una vez desde la Consola de Ruby de SketchUp (Ventana > Consola de Ruby):\n\n" \
+          "PLUGIN.write_default('#{Plugin::SETTINGS_KEY_ROSSI_API_ENDPOINT}', 'https://.../api/opencutlist/importar')\n" \
+          "PLUGIN.write_default('#{Plugin::SETTINGS_KEY_ROSSI_API_KEY}', 'tu-api-key')"
+        )
+        return
+      end
+
+      Sketchup.status_text = 'ROSSI: sincronizando presupuesto...'
+
+      UI.start_timer(0.1, false) do
+        begin
+          uri = URI.parse(endpoint)
+
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.use_ssl = uri.scheme == 'https'
+          http.open_timeout = 10
+          http.read_timeout = 30
+
+          request = Net::HTTP::Post.new(uri.request_uri)
+          request['Content-Type'] = 'application/json'
+          request['Accept'] = 'application/json'
+          request['X-API-KEY'] = api_key
+          request.body = JSON.generate(payload)
+
+          response = http.request(request)
+          codigo = response.code.to_i
+
+          if codigo.between?(200, 299)
+            respuesta = JSON.parse(response.body)
+
+            Sketchup.status_text = 'ROSSI: sincronización completada'
+
+            UI.messagebox(
+              "Envío realizado correctamente.\n\n" \
+              "#{respuesta['mensaje']}\n" \
+              "Productos recibidos: #{respuesta['cantidad_productos']}"
+            )
+          else
+            Sketchup.status_text = 'ROSSI: el servidor rechazó el envío'
+
+            UI.messagebox(
+              "El servidor rechazó el envío.\n\n" \
+              "Código HTTP: #{response.code}\n\n" \
+              "#{response.body}"
+            )
+          end
+
+        rescue StandardError => e
+          Sketchup.status_text = 'ROSSI: error de sincronización'
+
+          UI.messagebox(
+            "Error al enviar el POST.\n\n" \
+            "#{e.class}: #{e.message}"
+          )
+        ensure
+          UI.start_timer(3, false) do
+            Sketchup.status_text = ''
+          end
+        end
+      end
+
+      nil
+    end
+
+    
+
+    def parse_ocl_number(value)
+      return 0.0 if value.nil?
+
+      number = value.to_s.gsub(/[^\d,.\-]/, '')
+
+      # OCL en español devuelve, por ejemplo: "1,58 m²"
+      if number.include?(',') && number.include?('.')
+        # Formato posible: 1.234,56
+        number = number.delete('.').tr(',', '.')
+      elsif number.include?(',')
+        number = number.tr(',', '.')
+      end
+
+      number.to_f
     end
 
     def export_command(settings)

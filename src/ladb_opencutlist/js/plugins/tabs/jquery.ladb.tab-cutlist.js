@@ -51,6 +51,7 @@
         this.$header = $('.ladb-header', this.$element);
         this.$headerExtra = $('.ladb-header-extra', this.$header);
         this.$btnGenerate = $('#ladb_btn_generate', this.$header);
+        this.$btnRossi = $('#ladb_btn_export_rossi', this.$header);
         this.$btnPrint = $('#ladb_btn_print', this.$header);
         this.$btnExport = $('#ladb_btn_export', this.$header);
         this.$btnLayout = $('#ladb_btn_layout', this.$header);
@@ -77,6 +78,15 @@
 
     // Cutlist /////
 
+
+    LadbTabCutlist.prototype.exportRossi = function () {
+        const that = this;
+
+        rubyCallCommand('cutlist_export_rossi', {}, function (response) {
+            console.log('Respuesta Rossi:', response);
+        });
+    };
+
     LadbTabCutlist.prototype.generateCutlist = function (callback) {
         const that = this;
 
@@ -88,6 +98,7 @@
         this.groups = [];
         this.$page.empty();
         this.$btnGenerate.prop('disabled', true);
+        this.$btnRossi.prop('disabled', true);
         this.popToRootSlide();
         this.hideModalInside();
 
@@ -100,6 +111,7 @@
 
                 that.generateAt = new Date().getTime() / 1000;
                 that.setObsolete(false);
+                that.$btnRossi.prop('disabled', false);
 
                 const errors = response.errors;
                 const warnings = response.warnings;
@@ -6500,6 +6512,10 @@
             that.selectionGroupId = null;
             that.selectionPartIds = [];
             that.generateCutlist();
+            this.blur();
+        });
+        this.$btnRossi.on('click', function () {
+            that.exportRossi();
             this.blur();
         });
         this.$btnPrint.on('click', function () {

@@ -67,6 +67,8 @@ module Ladb::OpenCutList
     SETTINGS_KEY_DIALOG_PRINT_MARGIN = 'settings.dialog_print_margin'
     SETTINGS_KEY_COMPONENTS_LAST_DIR = 'settings.components_last_dir'
     SETTINGS_KEY_MATERIALS_LAST_DIR = 'settings.materials_last_dir'
+    SETTINGS_KEY_ROSSI_API_ENDPOINT = 'settings.rossi_api_endpoint'
+    SETTINGS_KEY_ROSSI_API_KEY = 'settings.rossi_api_key'
 
     TABS_DIALOG_STYLE = Sketchup.version_number >= 2300000000 ? UI::HtmlDialog::STYLE_UTILITY : UI::HtmlDialog::STYLE_DIALOG
     TABS_DIALOG_USE_CONTENT_SIZE = Sketchup.version_number >= 2300000000

@@ -204,10 +204,10 @@ module Ladb::OpenCutList
       @cutting_width = _def.cutlist_part.cutting_width
       @edge_cutting_length = _def.cutlist_part.edge_cutting_length
       @edge_cutting_width = _def.cutlist_part.edge_cutting_width
-      @length_increase = _def.cutlist_part.length_increase
-      @width_increase = _def.cutlist_part.width_increase
-      @length_increased = _def.cutlist_part.length_increased
-      @width_increased = _def.cutlist_part.width_increased
+      @length_increase = 0
+      @width_increase = 0
+      @length_increased = false
+      @width_increased = false
       @count = _def.count
       @tags = _def.cutlist_part.tags
       @flipped = _def.cutlist_part.flipped

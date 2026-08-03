@@ -10,7 +10,7 @@ module Ladb
       if Sketchup.version_number < 1700000000
         UI.messagebox("/!\ CAUTION\nOpenCutList requires SketchUp 2017 or above to run correctly.\nDowngrade to version 3.x to run on prior version of SketchUp.", MB_OK)
       end
-
+      UI.messagebox("OpenCutList Rossi cargado")
       # Plugin ID and DIR
       _file_ = __FILE__.dup
       _file_.force_encoding("UTF-8") if _file_.respond_to?(:force_encoding)
