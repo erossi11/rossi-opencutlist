@@ -51,7 +51,10 @@
         this.$header = $('.ladb-header', this.$element);
         this.$headerExtra = $('.ladb-header-extra', this.$header);
         this.$btnGenerate = $('#ladb_btn_generate', this.$header);
-        this.$btnRossi = $('#ladb_btn_export_rossi', this.$header);
+        this.$btnRossiMenu = $('#ladb_btn_rossi_menu', this.$header);
+        this.$itemExportRossi = $('#ladb_item_export_rossi', this.$header);
+        this.$itemExportProject = $('#ladb_item_export_project', this.$header);
+        this.$itemAddToRossiSeries = $('#ladb_item_add_to_rossi_series', this.$header);
         this.$btnPrint = $('#ladb_btn_print', this.$header);
         this.$btnExport = $('#ladb_btn_export', this.$header);
         this.$btnLayout = $('#ladb_btn_layout', this.$header);
@@ -82,8 +85,138 @@
     LadbTabCutlist.prototype.exportRossi = function () {
         const that = this;
 
+        that.$btnRossiMenu.prop('disabled', true);
+
         rubyCallCommand('cutlist_export_rossi', {}, function (response) {
-            console.log('Respuesta Rossi:', response);
+            if (!response || !response.ok) {
+
+                // cutlist no generado o inputbox de datos cancelado por el usuario
+                that.$btnRossiMenu.prop('disabled', false);
+                return;
+
+            }
+
+            // El resultado real llega después, de forma asíncrona, por el evento 'on_rossi_export_result'
+            that.dialog.startProgress(1);
+            that.dialog.changeLabelProgress('Esperando respuesta de Rossi Fábrica del Mueble....');
+        });
+    };
+
+    LadbTabCutlist.prototype.confirmExportRossi = function () {
+        const that = this;
+
+        that.$btnRossiMenu.prop('disabled', true);
+        that.dialog.startProgress(1);
+        that.dialog.changeLabelProgress('Esperando respuesta de Rossi Fábrica del Mueble....');
+
+        rubyCallCommand('cutlist_export_rossi_confirm', {}, function (response) {
+            if (!response || !response.ok) {
+                that.dialog.finishProgress();
+                that.$btnRossiMenu.prop('disabled', false);
+            }
+
+            // El resultado real llega por el evento 'on_rossi_export_result'
+        });
+    };
+
+    LadbTabCutlist.prototype.exportProject = function () {
+        const that = this;
+
+        that.$btnRossiMenu.prop('disabled', true);
+
+        rubyCallCommand('cutlist_export_project', {}, function (response) {
+            if (!response || !response.ok) {
+
+                // cutlist no generado o inputbox de datos cancelado por el usuario
+                that.$btnRossiMenu.prop('disabled', false);
+                return;
+
+            }
+
+            // El resultado real llega después, de forma asíncrona, por el evento 'on_rossi_project_muebles_result'
+            that.dialog.startProgress(1);
+            that.dialog.changeLabelProgress('Esperando respuesta de Rossi Fábrica del Mueble....');
+        });
+    };
+
+    LadbTabCutlist.prototype.showRossiMuebleSelector = function (idProyecto, muebles) {
+        const that = this;
+
+        // El botón ya llega habilitado (lo rehabilita el listener de
+        // 'on_rossi_project_muebles_result' antes de llamar acá) para que,
+        // si el usuario cancela este modal, no quede deshabilitado para siempre.
+
+        const logoRossi = '<img src="../img/logo-rossi.png" alt="Rossi" style="max-height:40px;margin-bottom:10px;">';
+
+        const escapeHtml = function (value) {
+            return $('<div>').text(value == null ? '' : value).html();
+        };
+
+        if (muebles.length === 0) {
+            that.dialog.alert('Rossi', logoRossi + '<p>No se encontraron amoblamientos para el proyecto ' + escapeHtml(idProyecto) + '.</p>');
+            return;
+        }
+
+        const opciones = muebles.map(function (mueble) {
+            const etiqueta = escapeHtml(mueble.nombre) + (mueble.tiene_despiece ? ' — ya tiene despiece' : '');
+            return '<option value="' + escapeHtml(mueble.id) + '">' + etiqueta + '</option>';
+        }).join('');
+
+        const html =
+            logoRossi +
+            '<p>Elegí el amoblamiento del proyecto ' + escapeHtml(idProyecto) + ' al que querés exportar el despiece:</p>' +
+            '<select id="ladb_rossi_select_mueble" class="selectpicker form-control">' + opciones + '</select>';
+
+        that.dialog.confirm(
+            'Seleccionar amoblamiento',
+            html,
+            function () {
+                const idMueble = $('#ladb_rossi_select_mueble').val();
+
+                that.$btnRossiMenu.prop('disabled', true);
+                that.dialog.startProgress(1);
+                that.dialog.changeLabelProgress('Esperando respuesta de Rossi Fábrica del Mueble....');
+
+                rubyCallCommand('cutlist_export_project_select_mueble', { id_proyecto: idProyecto, id_mueble: idMueble }, function (response) {
+                    if (!response || !response.ok) {
+                        that.dialog.finishProgress();
+                        that.$btnRossiMenu.prop('disabled', false);
+                        return;
+                    }
+
+                    // El resultado real llega después, de forma asíncrona, por el evento 'on_rossi_export_project_result'
+                });
+            },
+            { confirmBtnType: 'primary', confirmBtnLabel: 'Continuar' }
+        );
+
+        if ($.fn.selectpicker) {
+            $('#ladb_rossi_select_mueble').selectpicker();
+        }
+    };
+
+    LadbTabCutlist.prototype.confirmExportProject = function (eliminarDespieceExistente) {
+        const that = this;
+
+        that.$btnRossiMenu.prop('disabled', true);
+        that.dialog.startProgress(1);
+        that.dialog.changeLabelProgress('Esperando respuesta de Rossi Fábrica del Mueble....');
+
+        rubyCallCommand('cutlist_export_project_confirm', { eliminar_despiece_existente: !!eliminarDespieceExistente }, function (response) {
+            if (!response || !response.ok) {
+                that.dialog.finishProgress();
+                that.$btnRossiMenu.prop('disabled', false);
+            }
+
+            // El resultado real llega por el evento 'on_rossi_export_project_result'
+        });
+    };
+
+    LadbTabCutlist.prototype.addToRossiSeries = function () {
+        const that = this;
+
+        rubyCallCommand('cutlist_add_to_rossi_series', {}, function (response) {
+            console.log('Respuesta Rossi Series:', response);
         });
     };
 
@@ -98,7 +231,7 @@
         this.groups = [];
         this.$page.empty();
         this.$btnGenerate.prop('disabled', true);
-        this.$btnRossi.prop('disabled', true);
+        this.$btnRossiMenu.prop('disabled', true);
         this.popToRootSlide();
         this.hideModalInside();
 
@@ -111,7 +244,7 @@
 
                 that.generateAt = new Date().getTime() / 1000;
                 that.setObsolete(false);
-                that.$btnRossi.prop('disabled', false);
+                that.$btnRossiMenu.prop('disabled', false);
 
                 const errors = response.errors;
                 const warnings = response.warnings;
@@ -6514,8 +6647,212 @@
             that.generateCutlist();
             this.blur();
         });
-        this.$btnRossi.on('click', function () {
-            that.exportRossi();
+        this.$itemExportRossi.on('click', function () {
+            if (!$(this).parents('li').hasClass('disabled')) {
+                that.exportRossi();
+            }
+            this.blur();
+        });
+        this.$itemExportProject.on('click', function () {
+            if (!$(this).parents('li').hasClass('disabled')) {
+                that.exportProject();
+            }
+            this.blur();
+        });
+
+        // Resultado asíncrono del envío a Rossi (llega después de que el
+        // comando 'cutlist_export_rossi' / 'cutlist_export_rossi_confirm'
+        // ya retornó, una vez que termina el POST real hacia gestionrf)
+        addEventCallback('on_rossi_export_result', function (params) {
+
+            that.dialog.finishProgress();
+            that.$btnRossiMenu.prop('disabled', false);
+
+            const logoRossi = '<img src="../img/logo-rossi.png" alt="Rossi" style="max-height:40px;margin-bottom:10px;">';
+
+            if (params.status === 'requiere_confirmacion') {
+
+                const reconocidos = params.productos_reconocidos || [];
+                const noReconocidos = params.productos_no_reconocidos || [];
+
+                const escapeHtml = function (value) {
+                    return $('<div>').text(value == null ? '' : value).html();
+                };
+
+                const filasReconocidos = reconocidos.map(function (producto) {
+                    return '<tr>' +
+                        '<td>' + escapeHtml(producto.nombre_ocl) + '</td>' +
+                        '<td>' + escapeHtml(producto.nombre) + '</td>' +
+                        '<td class="text-success">✓ Reconocido</td>' +
+                        '</tr>';
+                }).join('');
+
+                const filasNoReconocidos = noReconocidos.map(function (producto) {
+                    return '<tr>' +
+                        '<td>' + escapeHtml(producto.nombre_ocl) + '</td>' +
+                        '<td>—</td>' +
+                        '<td class="text-danger">✗ No reconocido</td>' +
+                        '</tr>';
+                }).join('');
+
+                const tabla =
+                    '<table class="table table-condensed table-bordered">' +
+                    '<thead><tr><th>Material en OCL</th><th>Producto en gestionrf</th><th>Estado</th></tr></thead>' +
+                    '<tbody>' + filasReconocidos + filasNoReconocidos + '</tbody>' +
+                    '</table>';
+
+                const intro = noReconocidos.length > 0
+                    ? 'Se reconocieron ' + reconocidos.length + ' de ' + (reconocidos.length + noReconocidos.length) + ' productos. Los no reconocidos se omitirán de la importación.'
+                    : 'Se reconocieron los ' + reconocidos.length + ' productos.';
+
+                that.dialog.confirm(
+                    'Confirmar importación a Rossi',
+                    logoRossi + '<p>' + intro + '</p>' + tabla + '<p>¿Confirma la importación?</p>',
+                    function () {
+                        that.confirmExportRossi();
+                    },
+                    noReconocidos.length > 0
+                        ? { confirmBtnType: 'warning', confirmBtnLabel: 'Importar solo reconocidos' }
+                        : { confirmBtnType: 'primary', confirmBtnLabel: 'Confirmar importación' }
+                );
+
+            } else if (params.status === 'success') {
+
+                let mensaje = params.mensaje || 'Importación realizada correctamente.';
+                if (params.cantidad_productos) {
+                    mensaje += '<br>Productos importados: ' + params.cantidad_productos;
+                }
+                if (params.importacion_parcial) {
+                    mensaje += '<br><em>Se omitieron los productos no reconocidos.</em>';
+                }
+
+                that.dialog.alert('Rossi', logoRossi + '<p>' + mensaje + '</p>');
+
+            } else {
+
+                that.dialog.alert('Rossi', logoRossi + '<p>' + (params.mensaje || 'Ocurrió un error al sincronizar con Rossi.') + '</p>');
+
+            }
+
+        });
+
+        // Resultado asíncrono de "Exportar Proyecto" (llega después de que
+        // el comando 'cutlist_export_project' / 'cutlist_export_project_confirm'
+        // ya retornó, una vez que termina el POST real hacia gestionrf)
+        addEventCallback('on_rossi_project_muebles_result', function (params) {
+
+            that.dialog.finishProgress();
+
+            const logoRossi = '<img src="../img/logo-rossi.png" alt="Rossi" style="max-height:40px;margin-bottom:10px;">';
+
+            that.$btnRossiMenu.prop('disabled', false);
+
+            if (!params || params.status !== 'success') {
+                that.dialog.alert('Rossi', logoRossi + '<p>' + ((params && params.mensaje) || 'No se pudo obtener el listado de amoblamientos.') + '</p>');
+                return;
+            }
+
+            that.showRossiMuebleSelector(params.id_proyecto, params.muebles || []);
+
+        });
+
+        addEventCallback('on_rossi_export_project_result', function (params) {
+
+            that.dialog.finishProgress();
+            that.$btnRossiMenu.prop('disabled', false);
+
+            const logoRossi = '<img src="../img/logo-rossi.png" alt="Rossi" style="max-height:40px;margin-bottom:10px;">';
+
+            if (params.status === 'requiere_confirmacion') {
+
+                const reconocidos = params.materiales_reconocidos || [];
+                const noReconocidos = params.materiales_no_reconocidos || [];
+                const piezasExistentes = params.piezas_existentes || 0;
+
+                const escapeHtml = function (value) {
+                    return $('<div>').text(value == null ? '' : value).html();
+                };
+
+                const filasReconocidos = reconocidos.map(function (material) {
+                    return '<tr>' +
+                        '<td>' + escapeHtml(material.nombre_ocl) + '</td>' +
+                        '<td>' + escapeHtml(material.nombre) + '</td>' +
+                        '<td>' + (material.cantidad_piezas != null ? material.cantidad_piezas : '') + '</td>' +
+                        '<td class="text-success">✓ Reconocido</td>' +
+                        '</tr>';
+                }).join('');
+
+                const filasNoReconocidos = noReconocidos.map(function (material) {
+                    return '<tr>' +
+                        '<td>' + escapeHtml(material.nombre_ocl) + '</td>' +
+                        '<td>—</td>' +
+                        '<td>' + (material.cantidad_piezas != null ? material.cantidad_piezas : '') + '</td>' +
+                        '<td class="text-danger">✗ No reconocido</td>' +
+                        '</tr>';
+                }).join('');
+
+                const tabla =
+                    '<table class="table table-condensed table-bordered">' +
+                    '<thead><tr><th>Material en OCL</th><th>Producto en gestionrf</th><th>Piezas</th><th>Estado</th></tr></thead>' +
+                    '<tbody>' + filasReconocidos + filasNoReconocidos + '</tbody>' +
+                    '</table>';
+
+                const intro = noReconocidos.length > 0
+                    ? 'Se reconocieron ' + reconocidos.length + ' de ' + (reconocidos.length + noReconocidos.length) + ' materiales. Las piezas de los no reconocidos se omitirán de la exportación.'
+                    : 'Se reconocieron los ' + reconocidos.length + ' materiales.';
+
+                const avisoReemplazo = piezasExistentes > 0
+                    ? '<p><strong>Ya existen ' + piezasExistentes + ' piezas guardadas para este proyecto y mueble, de una exportación anterior.</strong></p>'
+                    : '';
+
+                const opcionesDespiece = piezasExistentes > 0
+                    ? '<div class="radio"><label><input type="radio" name="rossi_eliminar_despiece" value="1" checked> Eliminar despiece existente y reemplazar</label></div>' +
+                      '<div class="radio"><label><input type="radio" name="rossi_eliminar_despiece" value="0"> Agregar piezas reconocidas sin eliminar lo existente</label></div>'
+                    : '';
+
+                let confirmOptions;
+                if (noReconocidos.length > 0) {
+                    confirmOptions = { confirmBtnType: 'warning', confirmBtnLabel: 'Exportar solo reconocidos' };
+                } else {
+                    confirmOptions = { confirmBtnType: 'primary', confirmBtnLabel: 'Confirmar exportación' };
+                }
+
+                that.dialog.confirm(
+                    'Confirmar exportación de proyecto a Rossi',
+                    logoRossi + '<p>' + intro + '</p>' + tabla + avisoReemplazo + opcionesDespiece + '<p>¿Confirma la exportación?</p>',
+                    function () {
+                        const eliminarDespieceExistente = piezasExistentes > 0
+                            ? $('input[name="rossi_eliminar_despiece"]:checked').val() === '1'
+                            : true; // no hay nada que eliminar, el valor es irrelevante
+                        that.confirmExportProject(eliminarDespieceExistente);
+                    },
+                    confirmOptions
+                );
+
+            } else if (params.status === 'success') {
+
+                let mensaje = params.mensaje || 'Proyecto exportado correctamente.';
+                if (params.piezas_creadas != null) {
+                    mensaje += '<br>Piezas exportadas: ' + params.piezas_creadas;
+                }
+                if (params.piezas_reemplazadas) {
+                    mensaje += '<br><em>Se reemplazaron ' + params.piezas_reemplazadas + ' piezas de una exportación anterior.</em>';
+                }
+
+                that.dialog.alert('Rossi', logoRossi + '<p>' + mensaje + '</p>');
+
+            } else {
+
+                that.dialog.alert('Rossi', logoRossi + '<p>' + (params.mensaje || 'Ocurrió un error al exportar el proyecto.') + '</p>');
+
+            }
+
+        });
+
+        this.$itemAddToRossiSeries.on('click', function () {
+            if (!$(this).parents('li').hasClass('disabled')) {
+                that.addToRossiSeries();
+            }
             this.blur();
         });
         this.$btnPrint.on('click', function () {
