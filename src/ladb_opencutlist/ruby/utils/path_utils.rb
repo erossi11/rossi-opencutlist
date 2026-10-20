@@ -3,6 +3,7 @@ module Ladb::OpenCutList
   module PathUtils
 
     SEPARATOR = '>'.freeze
+    PERSISTENT_ID_SEPARATOR = '.'.freeze
 
     # -- Serialization --
 
@@ -24,6 +25,20 @@ module Ladb::OpenCutList
         end
       }
       path
+    end
+
+    # Persistent, cross-session identifier for a real physical instance path.
+    #
+    # Se probó primero preferir la API nativa Sketchup::InstancePath#persistent_id_path
+    # (cuando existe) sobre este join manual, pero se descartó tras verificar en vivo
+    # (proyecto real, 44 instancias) que devuelve rutas DUPLICADAS/incorrectas para varias
+    # instancias distintas (algunas incluso truncadas a solo 2 niveles) - rompiendo la
+    # premisa central de identidad única por pieza física. El join manual de
+    # Entity#persistent_id por segmento, en cambio, dio 44 rutas únicas sobre 44 instancias
+    # en la misma prueba. Se usa exclusivamente este método, sin intentar InstancePath.
+    def self.persistent_id_path(path)  # path is Array<ComponentInstance/Group>
+      return nil unless path.is_a?(Array) && !path.empty?
+      path.map { |entity| entity.persistent_id }.join(PERSISTENT_ID_SEPARATOR)
     end
 
     # -- Named --

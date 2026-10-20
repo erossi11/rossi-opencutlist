@@ -60,6 +60,14 @@ module Ladb::OpenCutList
             three_part_instance_def = ThreePartInstanceDef.new
             three_part_instance_def.matrix = _to_three_matrix(instance_info.entity.transformation)
             three_part_instance_def.id = part.id
+            three_part_instance_def.runtime_index = three_model_def.part_instance_count
+            three_part_instance_def.persistent_id = instance_info.persistent_id
+            three_part_instance_def.persistent_id_path = instance_info.persistent_id_path
+            three_part_instance_def.part_number = part.number
+            three_part_instance_def.material_name = part.material_name
+            three_part_instance_def.length = part.length.to_s.to_l.to_mm.round(2)
+            three_part_instance_def.width = part.width.to_s.to_l.to_mm.round(2)
+            three_part_instance_def.thickness = part.thickness.to_s.to_l.to_mm.round(2)
             three_part_instance_def.text = _evaluate_text(InstanceData.new(
 
               number: StringFormulaWrapper.new(part.number),
@@ -187,21 +195,39 @@ module Ladb::OpenCutList
         three_part_def = ThreePartDef.new
         three_part_def.face_vertices,
         three_part_def.face_colors,
+        three_part_def.face_uvs,
+        three_part_def.face_groups,
         three_part_def.hard_edge_vertices,
         three_part_def.soft_edge_vertices,
         three_part_def.soft_edge_controls0,
         three_part_def.soft_edge_controls1,
-        three_part_def.soft_edge_directions = _grab_entities_vertices_and_colors(definition.entities, material)
+        three_part_def.soft_edge_directions = _grab_entities_vertices_and_colors(definition.entities, material, nil, three_model_def)
         three_part_def.color = _to_three_color(material)
+        three_part_def.material_name = material.is_a?(Sketchup::Material) ? material.name : nil
+
+        # Sin ningún face_group texturado no hay UVs útiles en esta pieza - se
+        # descarta el array entero (en vez de mandar puros ceros) para no
+        # engordar el payload de proyectos sin materiales texturados.
+        three_part_def.face_uvs = [] unless three_part_def.face_groups.any? { |g| g[:textured] }
+        three_part_def.face_groups.each { |g| g.delete(:textured) }
 
         three_model_def.part_defs.store(part.id, three_part_def)
       end
 
     end
 
-    def _grab_entities_vertices_and_colors(entities, material, transformation = nil)
+    # three_model_def: se necesita durante toda la recursión para poder registrar
+    # (_register_material_texture) la textura de CUALQUIER material que aparezca
+    # en cualquier cara, no solo el material "de referencia" de la pieza - los
+    # cantos/caras pintadas individualmente (con un material propio, ej. canto
+    # blanco) ahora arman su propio grupo de geometría con su propio color o
+    # textura real, en vez de heredar/mancharse con la textura de la cara
+    # principal (bug detectado en vivo: cantos blancos aparecían negros).
+    def _grab_entities_vertices_and_colors(entities, material, transformation = nil, three_model_def = nil)
       face_vertices = []
       face_colors = []
+      face_uvs = []
+      face_groups = []
       hard_edge_vertices = []
       soft_edge_vertices = []
       soft_edge_controls0 = []
@@ -212,9 +238,12 @@ module Ladb::OpenCutList
         next unless entity.visible? && _layer_visible?(entity.layer)
 
         if entity.is_a?(Sketchup::Face)
-          fv, fc = _grab_face_vertices_and_colors(entity, material, transformation)
+          fv, fc, fu, fg = _grab_face_vertices_and_colors(entity, material, transformation, three_model_def)
+          fg[:start] = face_vertices.length / 3
           face_vertices.concat(fv)
           face_colors.concat(fc)
+          face_uvs.concat(fu)
+          face_groups.push(fg)
         elsif entity.is_a?(Sketchup::Edge)
           hev, sev, sec0, sec1, dir = _grab_edge_vertices_and_controls(entity, transformation)
           hard_edge_vertices.concat(hev)
@@ -223,18 +252,26 @@ module Ladb::OpenCutList
           soft_edge_controls1.concat(sec1)
           soft_edge_directions.concat(dir)
         elsif entity.is_a?(Sketchup::Group)
-          fv, fc, hev, sev, sec0, sec1, dir = _grab_entities_vertices_and_colors(entity.entities, entity.material.nil? ? material : entity.material, TransformationUtils::multiply(transformation, entity.transformation))
+          fv, fc, fu, fg_list, hev, sev, sec0, sec1, dir = _grab_entities_vertices_and_colors(entity.entities, entity.material.nil? ? material : entity.material, TransformationUtils::multiply(transformation, entity.transformation), three_model_def)
+          offset = face_vertices.length / 3
+          fg_list.each { |g| g[:start] += offset }
           face_vertices.concat(fv)
           face_colors.concat(fc)
+          face_uvs.concat(fu)
+          face_groups.concat(fg_list)
           hard_edge_vertices.concat(hev)
           soft_edge_vertices.concat(sev)
           soft_edge_controls0.concat(sec0)
           soft_edge_controls1.concat(sec1)
           soft_edge_directions.concat(dir)
         elsif entity.is_a?(Sketchup::ComponentInstance) && entity.definition.behavior.cuts_opening?
-          fv, fc, hev, sev, sec0, sec1, dir = _grab_entities_vertices_and_colors(entity.definition.entities, entity.material.nil? ? material : entity.material, TransformationUtils::multiply(transformation, entity.transformation))
+          fv, fc, fu, fg_list, hev, sev, sec0, sec1, dir = _grab_entities_vertices_and_colors(entity.definition.entities, entity.material.nil? ? material : entity.material, TransformationUtils::multiply(transformation, entity.transformation), three_model_def)
+          offset = face_vertices.length / 3
+          fg_list.each { |g| g[:start] += offset }
           face_vertices.concat(fv)
           face_colors.concat(fc)
+          face_uvs.concat(fu)
+          face_groups.concat(fg_list)
           hard_edge_vertices.concat(hev)
           soft_edge_vertices.concat(sev)
           soft_edge_controls0.concat(sec0)
@@ -244,19 +281,31 @@ module Ladb::OpenCutList
 
       end
 
-      [ face_vertices, face_colors, hard_edge_vertices, soft_edge_vertices, soft_edge_controls0, soft_edge_controls1, soft_edge_directions ]
+      [ face_vertices, face_colors, face_uvs, face_groups, hard_edge_vertices, soft_edge_vertices, soft_edge_controls0, soft_edge_controls1, soft_edge_directions ]
     end
 
-    def _grab_face_vertices_and_colors(face, material, transformation = nil)
+    def _grab_face_vertices_and_colors(face, material, transformation = nil, three_model_def = nil)
 
-      mesh = face.mesh(0) # POLYGON_MESH_POINTS
+      effective_material = face.material.nil? ? material : face.material
+
+      # Se capturan UVs (para poder texturar) en CUALQUIER cara cuyo material
+      # efectivo tenga una textura real asignada - ya no se restringe al
+      # material "de referencia" de la pieza, porque ahora cada material
+      # distinto arma su propio grupo de geometría con su propia textura/color
+      # (ver face_groups). Se registra la textura de este material puntual
+      # (deduplicado por nombre, no-op si ya está registrado o no tiene textura).
+      capture_uv = effective_material.is_a?(Sketchup::Material) && !effective_material.texture.nil?
+      _register_material_texture(three_model_def, effective_material) if three_model_def
+
+      mesh = face.mesh(capture_uv ? 1 : 0) # POLYGON_MESH_POINTS | POLYGON_MESH_UVQ_FRONT
       points = mesh.points
       points.each { |point| point.transform!(transformation) } unless transformation.nil?
 
-      red, green, blue = _to_three_vertex_color(face.material.nil? ? material : face.material)
+      red, green, blue = _to_three_vertex_color(effective_material)
 
       vertices = []
       colors = []
+      uvs = []
       mesh.polygons.each { |polygon|
         polygon.each { |index|
 
@@ -271,10 +320,37 @@ module Ladb::OpenCutList
             colors << blue
           end
 
+          # Siempre se empuja un par (u, v) - aunque sea (0, 0) cuando esta cara
+          # puntual no captura UV - para que face_uvs quede 1:1 alineado con
+          # face_vertices dentro de la malla combinada de toda la pieza (si una
+          # cara con material distinto no empujara nada, correría/desalinearía
+          # las UVs de todas las caras siguientes).
+          if capture_uv
+            uvq = mesh.uv_at(index.abs, true)
+            q = uvq.z
+            uvs << (q != 0 ? uvq.x / q : uvq.x)
+            uvs << (q != 0 ? uvq.y / q : uvq.y)
+          else
+            uvs << 0.0
+            uvs << 0.0
+          end
+
         }
       }
 
-      [ vertices, colors ]
+      # :start se completa en el caller (_grab_entities_vertices_and_colors),
+      # acá todavía no se sabe el offset dentro del buffer combinado de la pieza.
+      # :textured es temporal, se usa solo para decidir si conviene descartar
+      # face_uvs entero en _create_three_part_def, y se borra antes de serializar.
+      group = {
+        material_name: effective_material.is_a?(Sketchup::Material) ? effective_material.name : nil,
+        color: _to_three_color(effective_material),
+        start: 0,
+        count: vertices.length / 3,
+        textured: capture_uv
+      }
+
+      [ vertices, colors, uvs, group ]
     end
 
     def _grab_edge_vertices_and_controls(edge, transformation = nil)
@@ -400,6 +476,43 @@ module Ladb::OpenCutList
       [ material.color.red / 255.0, material.color.green / 255.0, material.color.blue / 255.0 ]
     end
 
+    # Registra (una sola vez por nombre de material, deduplicado) la imagen de
+    # textura real como data URI base64 en three_model_def.textures. No se
+    # transporta por-instancia ni por-parte: todas las ThreePartDef que usan el
+    # mismo material comparten la misma entrada acá (mismo criterio de reuso
+    # que ya aplica part_defs para la geometría).
+    def _register_material_texture(three_model_def, material)
+      return unless material.is_a?(Sketchup::Material) && material.texture
+      return if three_model_def.textures.key?(material.name)
+
+      data_uri = _texture_to_data_uri(material.texture)
+      return if data_uri.nil?
+
+      three_model_def.textures[material.name] = {
+        data_uri: data_uri,
+        width: material.texture.width.to_f,   # pulgadas, tamaño real del tile de textura
+        height: material.texture.height.to_f
+      }
+    end
+
+    def _texture_to_data_uri(texture)
+      temp_dir = File.join(PLUGIN.temp_dir, 'material_textures_export')
+      Dir.mkdir(temp_dir) unless Dir.exist?(temp_dir)
+
+      texture_file = File.join(temp_dir, "#{SecureRandom.uuid}.png")
+
+      begin
+        texture.write(texture_file)
+        return nil unless File.exist?(texture_file)
+
+        "data:image/png;base64,#{Base64.strict_encode64(File.binread(texture_file))}"
+      ensure
+        File.delete(texture_file) if File.exist?(texture_file)
+      end
+    rescue StandardError
+      nil
+    end
+
     def _dump(three_object_def, level = 1)
       puts "#{'+'.rjust(level, '-')}#{three_object_def.class.to_s} #{three_object_def.name} #{(three_object_def.is_a?(ThreePartInstanceDef) ? three_object_def.id.to_s : '')}"
       if three_object_def.is_a?(ThreeModelDef)
@@ -473,11 +586,14 @@ module Ladb::OpenCutList
 
     include HashableHelper
 
-    attr_accessor :face_vertices, :face_colors, :hard_edge_vertices, :soft_edge_vertices, :soft_edge_controls0, :soft_edge_controls1, :soft_edge_directions, :text, :color
+    attr_accessor :face_vertices, :face_colors, :face_uvs, :face_groups, :hard_edge_vertices, :soft_edge_vertices, :soft_edge_controls0, :soft_edge_controls1, :soft_edge_directions, :text, :color, :material_name
 
     def initialize
       @face_vertices = []
       @face_colors = []
+      @face_uvs = []
+      @face_groups = []
+      @material_name = nil
       @hard_edge_vertices = []
       @soft_edge_vertices = []
       @soft_edge_controls0 = []
@@ -530,11 +646,12 @@ module Ladb::OpenCutList
   class ThreeModelDef < ThreeGroupDef
 
     attr_accessor :part_instance_count, :axes_matrix, :x_dim, :y_dim, :z_dim
-    attr_reader :part_defs
+    attr_reader :part_defs, :textures
 
     def initialize
       super(ThreeObjectDef::TYPE_MODEL)
       @part_defs = {}
+      @textures = {}   # material_name => { data_uri:, width:, height: } - deduplicado, ver _register_material_texture
       @part_instance_count = 0
       @axes_matrix = nil
       @x_dim = nil
@@ -546,12 +663,20 @@ module Ladb::OpenCutList
 
   class ThreePartInstanceDef < ThreeGroupDef
 
-    attr_accessor :id, :text
+    attr_accessor :id, :text, :runtime_index, :persistent_id, :persistent_id_path, :part_number, :material_name, :length, :width, :thickness
 
     def initialize
       super(ThreeObjectDef::TYPE_PART_INSTANCE)
       @id = nil
       @text = nil
+      @runtime_index = nil
+      @persistent_id = nil
+      @persistent_id_path = nil
+      @part_number = nil
+      @material_name = nil
+      @length = nil
+      @width = nil
+      @thickness = nil
     end
 
   end

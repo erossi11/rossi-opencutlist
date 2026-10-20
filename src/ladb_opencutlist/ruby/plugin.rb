@@ -70,6 +70,8 @@ module Ladb::OpenCutList
     SETTINGS_KEY_ROSSI_API_ENDPOINT = 'settings.rossi_api_endpoint'
     SETTINGS_KEY_ROSSI_API_KEY = 'settings.rossi_api_key'
     SETTINGS_KEY_ROSSI_SERIES_API_ENDPOINT = 'settings.rossi_series_api_endpoint'
+    SETTINGS_KEY_ROSSI_MODEL3D_API_ENDPOINT = 'settings.rossi_model3d_api_endpoint'
+    SETTINGS_KEY_ROSSI_PUBLIC_MODEL3D_API_ENDPOINT = 'settings.rossi_public_model3d_api_endpoint'
 
     TABS_DIALOG_STYLE = Sketchup.version_number >= 2300000000 ? UI::HtmlDialog::STYLE_UTILITY : UI::HtmlDialog::STYLE_DIALOG
     TABS_DIALOG_USE_CONTENT_SIZE = Sketchup.version_number >= 2300000000

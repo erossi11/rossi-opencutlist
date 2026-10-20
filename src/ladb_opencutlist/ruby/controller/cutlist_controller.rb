@@ -11,10 +11,22 @@ module Ladb::OpenCutList
   require 'json'
   require 'net/http'
   require 'uri'
+  require 'securerandom'
 
   Packy = Fiddle::Packy
 
   class CutlistController < Controller
+
+    # Materiales que identifican geometría "fantasma"/de comportamiento (ej.
+    # el estado "abierto" de una puerta en un Dynamic Component de SketchUp)
+    # que igual queda reconocida como pieza real por el cutlist, pero no debe
+    # viajar en la exportación del modelo 3D: no es una pieza fabricable, y al
+    # solaparse en el espacio con la pieza real tapa su textura. Detectado en
+    # vivo el 2026-09 en un proyecto real (material "OpenCloset").
+    EXCLUDED_MODEL3D_MATERIAL_NAMES = [ 'OpenCloset' ].freeze
+
+    # Segundos de espera (lectura/escritura) para el envío del modelo 3D.
+    ROSSI_MODEL3D_HTTP_TIMEOUT = 300
 
     def initialize()
       super('cutlist')
@@ -48,6 +60,18 @@ module Ladb::OpenCutList
 
       PLUGIN.register_command("cutlist_export_project_confirm") do |params|
         export_project_confirm_command(params)
+      end
+
+      PLUGIN.register_command("cutlist_export_rossi_model3d") do
+        export_rossi_model3d_command
+      end
+
+      PLUGIN.register_command("cutlist_export_rossi_model3d_select_mueble") do |params|
+        export_rossi_model3d_select_mueble_command(params)
+      end
+
+      PLUGIN.register_command("cutlist_publish_rossi_model3d") do
+        publish_rossi_model3d_command
       end
 
       PLUGIN.register_command("cutlist_add_to_rossi_series") do
@@ -262,6 +286,7 @@ module Ladb::OpenCutList
         cancelled: true
       } unless id_proyecto
 
+      @rossi_muebles_destino = 'project'
       listar_muebles_proyecto_rossi_async(id_proyecto)
 
       {
@@ -295,6 +320,8 @@ module Ladb::OpenCutList
         source: 'opencutlist',
         id_proyecto: id_proyecto,
         id_mueble: id_mueble,
+        source_model_uuid: obtener_source_model_uuid,
+        sketchup_model_guid: Sketchup.active_model.guid, # metadata/trazabilidad únicamente, NO usar para correlacionar (cambia en cada guardado)
         filename: cutlist_hash[:filename] || cutlist_hash['filename'],
         materiales: build_rossi_project_materiales(cutlist_hash)
       }
@@ -336,6 +363,289 @@ module Ladb::OpenCutList
         ok: true,
         processing: true
       }
+    end
+
+    def export_rossi_model3d_command
+      unless @cutlist
+        UI.messagebox('Primero debe generar el listado de partes.')
+
+        return {
+          ok: false,
+          error: 'cutlist_not_generated'
+        }
+      end
+
+      id_proyecto = solicitar_numero_proyecto
+
+      return {
+        ok: false,
+        cancelled: true
+      } unless id_proyecto
+
+      # El modelo 3D se asocia a un amoblamiento del proyecto (igual que el
+      # despiece): se listan los item_mueble y el usuario elige uno; el envío
+      # real ocurre en export_rossi_model3d_select_mueble_command.
+      @rossi_muebles_destino = 'model3d'
+      listar_muebles_proyecto_rossi_async(id_proyecto)
+
+      {
+        ok: true,
+        processing: true
+      }
+    end
+
+    def export_rossi_model3d_select_mueble_command(params)
+      unless @cutlist
+        UI.messagebox('Primero debe generar el listado de partes.')
+
+        return {
+          ok: false,
+          error: 'cutlist_not_generated'
+        }
+      end
+
+      id_proyecto = params[:id_proyecto].to_s.strip
+      id_mueble = params[:id_mueble].to_s.strip
+
+      return {
+        ok: false,
+        error: 'missing_params'
+      } if id_proyecto.empty? || id_mueble.empty?
+
+      rossi_model3d_payload = build_rossi_model3d_payload(
+        numero_proyecto: id_proyecto,
+        id_mueble: id_mueble
+      )
+
+      enviar_post_rossi_model3d(rossi_model3d_payload)
+
+      {
+        ok: true,
+        processing: true
+      }
+    end
+
+    # Payload del modelo 3D (geometría ThreeModelDef + identidad del .skp). Lo usan
+    # "Exportar Modelo 3D" (destino: proyecto/amoblamiento) y "Publicar modelo 3D
+    # para cliente" (destino: presupuesto); `destino` son los campos propios de cada uno.
+    def build_rossi_model3d_payload(destino)
+      require_relative '../worker/cutlist/cutlist_convert_to_three_worker'
+
+      parts = @cutlist.get_parts(nil).reject { |part| EXCLUDED_MODEL3D_MATERIAL_NAMES.include?(part.material_name) }
+      three_model_def = CutlistConvertToThreeWorker.new(parts, all_instances: true, parts_colored: true).run
+
+      {
+        schema_version: '1.0',
+        source: 'opencutlist',
+        source_model_uuid: obtener_source_model_uuid,
+        sketchup_model_guid: Sketchup.active_model.guid, # metadata/trazabilidad únicamente, NO usar para correlacionar (cambia en cada guardado)
+      }.merge(destino).merge(
+        filename: Sketchup.active_model.title,
+        modelo: three_model_def.to_hash
+      )
+    end
+
+    # -- Publicar modelo 3D para cliente --
+    # Envía el modelo a gestionrf asociado a un presupuesto; gestionrf lo publica en
+    # RossiClientes y devuelve el enlace público para el cliente. Independiente de
+    # "Exportar Modelo 3D" (que lo asocia a un amoblamiento de un proyecto).
+
+    def publish_rossi_model3d_command
+      unless @cutlist
+        UI.messagebox('Primero debe generar el listado de partes.')
+
+        return {
+          ok: false,
+          error: 'cutlist_not_generated'
+        }
+      end
+
+      endpoint = PLUGIN.read_default(Plugin::SETTINGS_KEY_ROSSI_PUBLIC_MODEL3D_API_ENDPOINT, nil)
+      api_key = PLUGIN.read_default(Plugin::SETTINGS_KEY_ROSSI_API_KEY, nil)
+
+      if endpoint.to_s.strip.empty? || api_key.to_s.strip.empty?
+        UI.messagebox(
+          "No se configuró la publicación de modelos 3D para clientes.\n\n" \
+          "Configurar una vez desde la Consola de Ruby de SketchUp (Ventana > Consola de Ruby):\n\n" \
+          "Ladb::OpenCutList::PLUGIN.write_default('#{Plugin::SETTINGS_KEY_ROSSI_PUBLIC_MODEL3D_API_ENDPOINT}', 'https://.../api/opencutlist/presupuesto/modelo3d')\n" \
+          "Ladb::OpenCutList::PLUGIN.write_default('#{Plugin::SETTINGS_KEY_ROSSI_API_KEY}', 'tu-api-key')"
+        )
+
+        return {
+          ok: false,
+          error: 'not_configured'
+        }
+      end
+
+      id_presupuesto = solicitar_numero_presupuesto_modelo3d
+
+      return {
+        ok: false,
+        cancelled: true
+      } unless id_presupuesto
+
+      consultar_y_publicar_modelo3d_async(endpoint, api_key, id_presupuesto)
+
+      {
+        ok: true,
+        processing: true
+      }
+    end
+
+    def solicitar_numero_presupuesto_modelo3d
+      # Se recuerda en el .skp el último presupuesto publicado, para republicar sin volver a buscarlo.
+      ultimo = Sketchup.active_model.get_attribute('RossiFabrica', 'id_presupuesto', '').to_s
+
+      result = UI.inputbox(
+        [ 'Número de presupuesto' ],
+        [ ultimo ],
+        'Publicar modelo 3D para cliente'
+      )
+
+      return nil unless result
+
+      id_presupuesto = result[0].to_s.strip
+
+      unless id_presupuesto =~ /\A\d+\z/
+        UI.messagebox('Debe ingresar un número de presupuesto válido.')
+        return nil
+      end
+
+      id_presupuesto
+    end
+
+    # Consulta el presupuesto (cliente y si ya hay un modelo publicado), pide
+    # confirmación y recién entonces genera y envía el modelo.
+    def consultar_y_publicar_modelo3d_async(endpoint, api_key, id_presupuesto)
+      Sketchup.status_text = 'ROSSI: consultando presupuesto...'
+
+      timer_id = UI.start_timer(0.1, false) do
+        # Un messagebox modal dentro de un timer puede hacer que SketchUp lo vuelva a disparar.
+        UI.stop_timer(timer_id)
+        uri = nil
+        begin
+          uri = URI.parse(endpoint)
+          uri.query = URI.encode_www_form(id_presupuesto: id_presupuesto)
+
+          codigo, respuesta, response = rossi_request_json(Net::HTTP::Get, uri, api_key, nil, 30)
+
+          unless codigo.between?(200, 299) && respuesta && respuesta['ok']
+            Sketchup.status_text = ''
+            PLUGIN.trigger_event('on_rossi_public_model3d_result', {
+              status: 'error',
+              mensaje: (respuesta && respuesta['mensaje']) || "Código HTTP: #{response.code}\n\n#{response.body}"
+            })
+            next
+          end
+
+          Sketchup.status_text = ''
+
+          if confirmar_publicacion_modelo3d(respuesta)
+            payload = build_rossi_model3d_payload(id_presupuesto: id_presupuesto)
+            enviar_post_rossi_public_model3d(endpoint, api_key, payload)
+          else
+            PLUGIN.trigger_event('on_rossi_public_model3d_result', { status: 'cancelled' })
+          end
+
+        rescue StandardError => e
+          Sketchup.status_text = ''
+          PLUGIN.trigger_event('on_rossi_public_model3d_result', {
+            status: 'error',
+            mensaje: rossi_mensaje_error(e, uri)
+          })
+        end
+      end
+
+      nil
+    end
+
+    def confirmar_publicacion_modelo3d(info)
+      cliente = info['cliente'].to_s.strip
+      mensaje = "Presupuesto N° #{info['id_presupuesto']}\nCliente: #{cliente.empty? ? '(sin cliente)' : cliente}\n\n"
+
+      modelo3d = info['modelo3d']
+      if modelo3d && modelo3d['estado'] == 'publicado'
+        mensaje += "Este presupuesto YA tiene un modelo 3D publicado (versión #{modelo3d['version']}).\n" \
+                   "Se va a reemplazar por el modelo abierto en SketchUp; el enlace del cliente no cambia.\n\n"
+        if modelo3d['source_model_uuid'] && modelo3d['source_model_uuid'] != obtener_source_model_uuid
+          mensaje += "ATENCIÓN: el modelo publicado se generó desde OTRO archivo de SketchUp.\n\n"
+        end
+      end
+
+      mensaje += '¿Publicar el modelo 3D para este cliente?'
+
+      UI.messagebox(mensaje, MB_YESNO) == IDYES
+    end
+
+    def enviar_post_rossi_public_model3d(endpoint, api_key, payload)
+      Sketchup.status_text = 'ROSSI: publicando modelo 3D...'
+
+      UI.start_timer(0.1, false) do
+        uri = nil
+        tamanio = nil
+        begin
+          uri = URI.parse(endpoint)
+          body = JSON.generate(payload)
+          tamanio = rossi_formatear_tamanio(body.bytesize)
+          Sketchup.status_text = "ROSSI: publicando modelo 3D (#{tamanio})... puede tardar"
+
+          inicio = Time.now
+          codigo, respuesta, response = rossi_request_json(Net::HTTP::Post, uri, api_key, body, ROSSI_MODEL3D_HTTP_TIMEOUT)
+          duracion = (Time.now - inicio).round(1)
+
+          if codigo.between?(200, 299) && respuesta && respuesta['ok']
+            Sketchup.status_text = 'ROSSI: modelo 3D publicado'
+            Sketchup.active_model.set_attribute('RossiFabrica', 'id_presupuesto', payload[:id_presupuesto].to_s)
+
+            PLUGIN.trigger_event('on_rossi_public_model3d_result', {
+              status: 'success',
+              mensaje: respuesta['mensaje'],
+              url: respuesta['url'],
+              cliente: respuesta['cliente'],
+              id_presupuesto: respuesta['id_presupuesto'],
+              version: respuesta['version'],
+              detalle: "#{tamanio} enviados en #{duracion} s"
+            })
+          else
+            Sketchup.status_text = 'ROSSI: no se pudo publicar el modelo 3D'
+
+            PLUGIN.trigger_event('on_rossi_public_model3d_result', {
+              status: 'error',
+              mensaje:
+                ((respuesta && respuesta['mensaje']) ||
+                "Código HTTP: #{response.code}\n\n#{response.body}") +
+                "\n\n(#{tamanio} enviados en #{duracion} s)"
+            })
+          end
+
+        rescue StandardError => e
+          Sketchup.status_text = 'ROSSI: error al publicar el modelo 3D'
+
+          mensaje = rossi_mensaje_error(e, uri)
+          mensaje += "\n\nTamaño del envío: #{tamanio}" if tamanio
+
+          PLUGIN.trigger_event('on_rossi_public_model3d_result', {
+            status: 'error',
+            mensaje: mensaje
+          })
+        ensure
+          UI.start_timer(3, false) do
+            Sketchup.status_text = ''
+          end
+        end
+      end
+
+      nil
+    end
+
+    def obtener_source_model_uuid
+      model = Sketchup.active_model
+      uuid = model.get_attribute('RossiFabrica', 'source_model_uuid', nil)
+      if uuid.nil?
+        uuid = SecureRandom.uuid
+        model.set_attribute('RossiFabrica', 'source_model_uuid', uuid)
+      end
+      uuid
     end
 
     def solicitar_numero_proyecto
@@ -413,6 +723,7 @@ module Ladb::OpenCutList
 
             PLUGIN.trigger_event('on_rossi_project_muebles_result', {
               status: 'success',
+              destino: @rossi_muebles_destino || 'project',
               id_proyecto: id_proyecto,
               muebles: respuesta['muebles'] || []
             })
@@ -432,7 +743,7 @@ module Ladb::OpenCutList
 
           PLUGIN.trigger_event('on_rossi_project_muebles_result', {
             status: 'error',
-            mensaje: "#{e.class}: #{e.message}"
+            mensaje: rossi_mensaje_error(e, uri)
           })
         ensure
           UI.start_timer(3, false) do
@@ -507,7 +818,17 @@ module Ladb::OpenCutList
           canto_ymin: part.edge_material_names[:ymin],
           canto_ymax: part.edge_material_names[:ymax],
           canto_xmin: part.edge_material_names[:xmin],
-          canto_xmax: part.edge_material_names[:xmax]
+          canto_xmax: part.edge_material_names[:xmax],
+
+          # Identidad física real de cada copia individual (misma pieza-tipo,
+          # distinta ocurrencia en el modelo). Se correlaciona con "Exportar
+          # Modelo 3D" vía source_model_uuid + persistent_id_path.
+          ocurrencias: part.def.instance_infos.values.map { |instance_info|
+            {
+              persistent_id: instance_info.persistent_id,
+              persistent_id_path: instance_info.persistent_id_path
+            }
+          }
         }
       end
     end
@@ -604,7 +925,7 @@ module Ladb::OpenCutList
 
           PLUGIN.trigger_event('on_rossi_export_project_result', {
             status: 'error',
-            mensaje: "#{e.class}: #{e.message}"
+            mensaje: rossi_mensaje_error(e, uri)
           })
         ensure
           UI.start_timer(3, false) do
@@ -1282,7 +1603,7 @@ module Ladb::OpenCutList
 
           PLUGIN.trigger_event('on_rossi_export_result', {
             status: 'error',
-            mensaje: "#{e.class}: #{e.message}"
+            mensaje: rossi_mensaje_error(e, uri)
           })
         ensure
           UI.start_timer(3, false) do
@@ -1294,7 +1615,126 @@ module Ladb::OpenCutList
       nil
     end
 
-    
+    def enviar_post_rossi_model3d(payload)
+      endpoint = PLUGIN.read_default(Plugin::SETTINGS_KEY_ROSSI_MODEL3D_API_ENDPOINT, nil)
+      api_key = PLUGIN.read_default(Plugin::SETTINGS_KEY_ROSSI_API_KEY, nil)
+
+      if endpoint.to_s.strip.empty? || api_key.to_s.strip.empty?
+        PLUGIN.trigger_event('on_rossi_model3d_export_result', {
+          status: 'error',
+          mensaje:
+            "No se configuró la conexión con el sistema de gestión Rossi para el modelo 3D.\n\n" \
+            "Configurar una vez desde la Consola de Ruby de SketchUp (Ventana > Consola de Ruby):\n\n" \
+            "Ladb::OpenCutList::PLUGIN.write_default('#{Plugin::SETTINGS_KEY_ROSSI_MODEL3D_API_ENDPOINT}', 'https://.../api/opencutlist/modelo3d')\n" \
+            "Ladb::OpenCutList::PLUGIN.write_default('#{Plugin::SETTINGS_KEY_ROSSI_API_KEY}', 'tu-api-key')"
+        })
+
+        return
+      end
+
+      Sketchup.status_text = 'ROSSI: exportando modelo 3D...'
+
+      UI.start_timer(0.1, false) do
+        begin
+          uri = URI.parse(endpoint)
+          body = JSON.generate(payload)
+
+          tamanio = rossi_formatear_tamanio(body.bytesize)
+          Sketchup.status_text = "ROSSI: exportando modelo 3D (#{tamanio})... puede tardar"
+
+          # Modelos grandes (all_instances) generan payloads pesados que el
+          # servidor puede tardar bastante en procesar.
+          inicio = Time.now
+          codigo, respuesta, response = rossi_request_json(Net::HTTP::Post, uri, api_key, body, ROSSI_MODEL3D_HTTP_TIMEOUT)
+          duracion = (Time.now - inicio).round(1)
+
+          if codigo.between?(200, 299) && respuesta && respuesta['ok']
+            Sketchup.status_text = 'ROSSI: modelo 3D exportado'
+
+            PLUGIN.trigger_event('on_rossi_model3d_export_result', {
+              status: 'success',
+              mensaje: "#{respuesta['mensaje']}\n\n(#{tamanio} enviados en #{duracion} s)"
+            })
+          else
+            Sketchup.status_text = 'ROSSI: el servidor rechazó el envío del modelo 3D'
+
+            PLUGIN.trigger_event('on_rossi_model3d_export_result', {
+              status: 'error',
+              mensaje:
+                ((respuesta && respuesta['mensaje']) ||
+                "Código HTTP: #{response.code}\n\n#{response.body}") +
+                "\n\n(#{tamanio} enviados en #{duracion} s)"
+            })
+          end
+
+        rescue StandardError => e
+          Sketchup.status_text = 'ROSSI: error de sincronización del modelo 3D'
+
+          mensaje = rossi_mensaje_error(e, uri)
+          mensaje += "\n\nTamaño del envío: #{tamanio}" if tamanio
+
+          PLUGIN.trigger_event('on_rossi_model3d_export_result', {
+            status: 'error',
+            mensaje: mensaje
+          })
+        ensure
+          UI.start_timer(3, false) do
+            Sketchup.status_text = ''
+          end
+        end
+      end
+
+      nil
+    end
+
+    # Request JSON con X-API-KEY. Devuelve [codigo_http, json_o_nil, response].
+    def rossi_request_json(request_class, uri, api_key, body, timeout)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = uri.scheme == 'https'
+      http.open_timeout = 10
+      http.read_timeout = timeout
+      http.write_timeout = timeout if http.respond_to?(:write_timeout=)
+
+      request = request_class.new(uri.request_uri)
+      request['Content-Type'] = 'application/json'
+      request['Accept'] = 'application/json'
+      request['X-API-KEY'] = api_key
+      request.body = body if body
+
+      response = http.request(request)
+
+      respuesta = begin
+        JSON.parse(response.body)
+      rescue StandardError
+        nil
+      end
+
+      [ response.code.to_i, respuesta, response ]
+    end
+
+    def rossi_mensaje_error(e, uri)
+      destino = uri && uri.host ? "#{uri.host}:#{uri.port}" : 'servidor'
+
+      case e
+      when Net::OpenTimeout, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Errno::ENETUNREACH, SocketError
+        "No se pudo conectar con el servidor Rossi (#{destino}).\n\n" \
+        "Verificá que el servidor esté encendido y en la misma red. " \
+        "Si el host termina en .local, agregalo al archivo hosts de Windows con su IP fija.\n\n" \
+        "#{e.class}: #{e.message}"
+      when Net::ReadTimeout
+        "El servidor Rossi (#{destino}) tardó demasiado en responder.\n\n" \
+        "Es posible que los datos sí se hayan guardado: verificá en el sistema antes de reenviar.\n\n" \
+        "#{e.class}: #{e.message}"
+      else
+        "#{e.class}: #{e.message}"
+      end
+    end
+
+    def rossi_formatear_tamanio(bytes)
+      return "#{(bytes / 1024.0).round(1)} KB" if bytes < 1024 * 1024
+
+      "#{(bytes / (1024.0 * 1024.0)).round(1)} MB"
+    end
 
     def parse_ocl_number(value)
       return 0.0 if value.nil?
@@ -1569,7 +2009,7 @@ module Ladb::OpenCutList
 
           UI.messagebox(
             "Error al enviar el POST.\n\n" \
-            "#{e.class}: #{e.message}"
+            "#{rossi_mensaje_error(e, uri)}"
           )
         ensure
           UI.start_timer(3, false) do

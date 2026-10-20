@@ -46,6 +46,15 @@ module Ladb::OpenCutList
       @serialized_path = PathUtils.serialize_path(@path)
     end
 
+    def persistent_id
+      entity.persistent_id
+    end
+
+    def persistent_id_path
+      return @persistent_id_path if @persistent_id_path
+      @persistent_id_path = PathUtils.persistent_id_path(@path)
+    end
+
     def named_path
       return @named_path if @named_path
       @named_path = PathUtils.get_named_path(@path).join('.')

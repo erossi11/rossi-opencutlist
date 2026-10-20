@@ -54,6 +54,8 @@
         this.$btnRossiMenu = $('#ladb_btn_rossi_menu', this.$header);
         this.$itemExportRossi = $('#ladb_item_export_rossi', this.$header);
         this.$itemExportProject = $('#ladb_item_export_project', this.$header);
+        this.$itemExportRossiModel3d = $('#ladb_item_export_rossi_model3d', this.$header);
+        this.$itemPublishRossiModel3d = $('#ladb_item_publish_rossi_model3d', this.$header);
         this.$itemAddToRossiSeries = $('#ladb_item_add_to_rossi_series', this.$header);
         this.$btnPrint = $('#ladb_btn_print', this.$header);
         this.$btnExport = $('#ladb_btn_export', this.$header);
@@ -139,8 +141,52 @@
         });
     };
 
-    LadbTabCutlist.prototype.showRossiMuebleSelector = function (idProyecto, muebles) {
+    LadbTabCutlist.prototype.exportRossiModel3d = function () {
         const that = this;
+
+        that.$btnRossiMenu.prop('disabled', true);
+
+        rubyCallCommand('cutlist_export_rossi_model3d', {}, function (response) {
+            if (!response || !response.ok) {
+
+                // cutlist no generado o inputbox de datos cancelado por el usuario
+                that.$btnRossiMenu.prop('disabled', false);
+                return;
+
+            }
+
+            // Primero llega el listado de amoblamientos ('on_rossi_project_muebles_result',
+            // destino 'model3d'); el envío real y su 'on_rossi_model3d_export_result'
+            // ocurren después de elegir el amoblamiento.
+            that.dialog.startProgress(1);
+            that.dialog.changeLabelProgress('Esperando respuesta de Rossi Fábrica del Mueble....');
+        });
+    };
+
+    LadbTabCutlist.prototype.publishRossiModel3d = function () {
+        const that = this;
+
+        that.$btnRossiMenu.prop('disabled', true);
+
+        rubyCallCommand('cutlist_publish_rossi_model3d', {}, function (response) {
+            if (!response || !response.ok) {
+
+                // cutlist no generado, sin configurar o inputbox cancelado por el usuario
+                that.$btnRossiMenu.prop('disabled', false);
+                return;
+
+            }
+
+            // Ruby consulta el presupuesto, pide confirmación y envía; el resultado
+            // llega por 'on_rossi_public_model3d_result'.
+            that.dialog.startProgress(1);
+            that.dialog.changeLabelProgress('Publicando el modelo 3D en Rossi Fábrica del Mueble....');
+        });
+    };
+
+    LadbTabCutlist.prototype.showRossiMuebleSelector = function (idProyecto, muebles, destino) {
+        const that = this;
+        const esModelo3d = destino === 'model3d';
 
         // El botón ya llega habilitado (lo rehabilita el listener de
         // 'on_rossi_project_muebles_result' antes de llamar acá) para que,
@@ -158,13 +204,14 @@
         }
 
         const opciones = muebles.map(function (mueble) {
-            const etiqueta = escapeHtml(mueble.nombre) + (mueble.tiene_despiece ? ' — ya tiene despiece' : '');
+            const yaTiene = esModelo3d ? mueble.tiene_modelo3d : mueble.tiene_despiece;
+            const etiqueta = escapeHtml(mueble.nombre) + (yaTiene ? (esModelo3d ? ' — ya tiene modelo 3D' : ' — ya tiene despiece') : '');
             return '<option value="' + escapeHtml(mueble.id) + '">' + etiqueta + '</option>';
         }).join('');
 
         const html =
             logoRossi +
-            '<p>Elegí el amoblamiento del proyecto ' + escapeHtml(idProyecto) + ' al que querés exportar el despiece:</p>' +
+            '<p>Elegí el amoblamiento del proyecto ' + escapeHtml(idProyecto) + ' al que querés exportar ' + (esModelo3d ? 'el modelo 3D' : 'el despiece') + ':</p>' +
             '<select id="ladb_rossi_select_mueble" class="selectpicker form-control">' + opciones + '</select>';
 
         that.dialog.confirm(
@@ -177,14 +224,17 @@
                 that.dialog.startProgress(1);
                 that.dialog.changeLabelProgress('Esperando respuesta de Rossi Fábrica del Mueble....');
 
-                rubyCallCommand('cutlist_export_project_select_mueble', { id_proyecto: idProyecto, id_mueble: idMueble }, function (response) {
+                const comando = esModelo3d ? 'cutlist_export_rossi_model3d_select_mueble' : 'cutlist_export_project_select_mueble';
+
+                rubyCallCommand(comando, { id_proyecto: idProyecto, id_mueble: idMueble }, function (response) {
                     if (!response || !response.ok) {
                         that.dialog.finishProgress();
                         that.$btnRossiMenu.prop('disabled', false);
                         return;
                     }
 
-                    // El resultado real llega después, de forma asíncrona, por el evento 'on_rossi_export_project_result'
+                    // El resultado real llega después, de forma asíncrona, por el evento
+                    // 'on_rossi_export_project_result' (despiece) o 'on_rossi_model3d_export_result' (3D)
                 });
             },
             { confirmBtnType: 'primary', confirmBtnLabel: 'Continuar' }
@@ -6659,6 +6709,18 @@
             }
             this.blur();
         });
+        this.$itemExportRossiModel3d.on('click', function () {
+            if (!$(this).parents('li').hasClass('disabled')) {
+                that.exportRossiModel3d();
+            }
+            this.blur();
+        });
+        this.$itemPublishRossiModel3d.on('click', function () {
+            if (!$(this).parents('li').hasClass('disabled')) {
+                that.publishRossiModel3d();
+            }
+            this.blur();
+        });
 
         // Resultado asíncrono del envío a Rossi (llega después de que el
         // comando 'cutlist_export_rossi' / 'cutlist_export_rossi_confirm'
@@ -6752,7 +6814,7 @@
                 return;
             }
 
-            that.showRossiMuebleSelector(params.id_proyecto, params.muebles || []);
+            that.showRossiMuebleSelector(params.id_proyecto, params.muebles || [], params.destino);
 
         });
 
@@ -6846,6 +6908,75 @@
                 that.dialog.alert('Rossi', logoRossi + '<p>' + (params.mensaje || 'Ocurrió un error al exportar el proyecto.') + '</p>');
 
             }
+
+        });
+
+        // Resultado asíncrono del envío del modelo 3D a Rossi (comando
+        // 'cutlist_export_rossi_model3d', mismo patrón que on_rossi_export_result
+        // pero sin paso de confirmación intermedio)
+        addEventCallback('on_rossi_model3d_export_result', function (params) {
+
+            that.dialog.finishProgress();
+            that.$btnRossiMenu.prop('disabled', false);
+
+            const logoRossi = '<img src="../img/logo-rossi.png" alt="Rossi" style="max-height:40px;margin-bottom:10px;">';
+
+            if (params.status === 'success') {
+                that.dialog.alert('Rossi', logoRossi + '<p>' + (params.mensaje || 'Modelo 3D exportado correctamente.') + '</p>');
+            } else {
+                that.dialog.alert('Rossi', logoRossi + '<p>' + (params.mensaje || 'Ocurrió un error al exportar el modelo 3D.') + '</p>');
+            }
+
+        });
+
+        // Resultado de "Publicar modelo 3D para cliente" (comando 'cutlist_publish_rossi_model3d')
+        addEventCallback('on_rossi_public_model3d_result', function (params) {
+
+            that.dialog.finishProgress();
+            that.$btnRossiMenu.prop('disabled', false);
+
+            if (params.status === 'cancelled') {
+                return;
+            }
+
+            const logoRossi = '<img src="../img/logo-rossi.png" alt="Rossi" style="max-height:40px;margin-bottom:10px;">';
+            const escapeHtml = function (value) {
+                return $('<div>').text(value == null ? '' : value).html();
+            };
+
+            if (params.status !== 'success') {
+                that.dialog.alert('Rossi', logoRossi + '<p>' + escapeHtml(params.mensaje || 'Ocurrió un error al publicar el modelo 3D.').replace(/\n/g, '<br>') + '</p>');
+                return;
+            }
+
+            const html = logoRossi
+                + '<p><strong>' + escapeHtml(params.mensaje || 'Modelo 3D publicado.') + '</strong></p>'
+                + '<p>Presupuesto N° ' + escapeHtml(params.id_presupuesto) + (params.cliente ? ' · ' + escapeHtml(params.cliente) : '') + '</p>'
+                + '<p>Enlace para el cliente:</p>'
+                + '<div class="input-group">'
+                + '<input id="ladb_rossi_public_url" type="text" class="form-control" readonly value="' + escapeHtml(params.url) + '">'
+                + '<span class="input-group-btn"><button id="ladb_rossi_public_url_copy" class="btn btn-default" type="button">Copiar enlace</button></span>'
+                + '</div>'
+                + '<p class="text-muted" style="margin-top:10px;">También queda disponible en el presupuesto de gestionrf para enviarlo por WhatsApp. (' + escapeHtml(params.detalle) + ')</p>';
+
+            that.dialog.alert('Rossi', html);
+
+            $('#ladb_rossi_public_url').on('click', function () { this.select(); });
+            $('#ladb_rossi_public_url_copy').on('click', function () {
+                const $input = $('#ladb_rossi_public_url');
+                $input.trigger('focus').trigger('select');
+                const $btn = $(this);
+                const copiado = function () { $btn.text('¡Copiado!'); };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText($input.val()).then(copiado, function () {
+                        document.execCommand('copy');
+                        copiado();
+                    });
+                } else {
+                    document.execCommand('copy');
+                    copiado();
+                }
+            });
 
         });
 
